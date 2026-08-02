@@ -25,25 +25,25 @@ class CalculatorEngine {
     }
 
     private fun handleDigit(state: CalculatorState, digit: String): CalculatorState {
-        val current = if (state.shouldReset) "" else state.display
+        val current = if (state.shouldResetDisplay) "" else state.display
         val newDisplay = if (current == "0" || current == "Ошибка") digit else current + digit
 
         return state.copy(
             display = newDisplay,
             currentOperand = newDisplay,
-            shouldReset = false
+            shouldResetDisplay = false
         )
     }
 
     private fun handleDecimal(state: CalculatorState): CalculatorState {
-        val display = if (state.shouldReset) "0" else state.display
+        val display = if (state.shouldResetDisplay) "0" else state.display
         if (display.contains(".")) return state
 
         val newDisplay = "$display."
         return state.copy(
             display = newDisplay,
             currentOperand = newDisplay,
-            shouldReset = false
+            shouldResetDisplay = false
         )
     }
 
@@ -51,7 +51,8 @@ class CalculatorEngine {
         val current = state.currentOperand.toDoubleOrNull()
             ?: return state
 
-        if (state.previousOperand.isNotEmpty() && state.currentOperator.isNotEmpty() && !state.shouldReset) {
+        // Если уже есть оператор и предыдущий операнд — цепочка вычислений
+        if (state.previousOperand.isNotEmpty() && state.currentOperator.isNotEmpty() && !state.shouldResetDisplay) {
             val result = calculate(
                 state.previousOperand.toDoubleOrNull() ?: return state,
                 current,
@@ -64,21 +65,21 @@ class CalculatorEngine {
                 currentOperand = resultStr,
                 previousOperand = resultStr,
                 currentOperator = op,
-                shouldReset = true
+                shouldResetDisplay = true
             )
         }
 
         return state.copy(
-            display = current,
-            expression = "$current $op",
+            display = formatDisplay(current),
+            expression = "${formatDisplay(current)} $op",
             previousOperand = current,
             currentOperator = op,
-            shouldReset = true
+            shouldResetDisplay = true
         )
     }
 
     private fun handleEquals(state: CalculatorState): CalculatorState {
-        val second = state.currentOperand.toDoubleOrElse()
+        val second = state.currentOperand.toDoubleOrNull()
         val first = state.previousOperand.toDoubleOrNull()
         val op = state.currentOperator
 
@@ -94,7 +95,7 @@ class CalculatorEngine {
             currentOperand = resultStr,
             previousOperand = "",
             currentOperator = "",
-            shouldReset = true
+            shouldResetDisplay = true
         )
     }
 
@@ -122,7 +123,7 @@ class CalculatorEngine {
 
     private fun handleBackspace(state: CalculatorState): CalculatorState {
         val display = state.display
-        if (display.isEmpty() || display == "0" || state.shouldReset) return state
+        if (display.isEmpty() || display == "0" || state.shouldResetDisplay) return state
 
         val newDisplay = if (display.length <= 1 || (display.startsWith("-") && display.length == 2)) {
             "0"
@@ -167,13 +168,5 @@ class CalculatorEngine {
         } else {
             value.toString()
         }
-    }
-}
-
-private fun String.toDoubleOrElse(): Double? {
-    return try {
-        this.toDouble()
-    } catch (_: NumberFormatException) {
-        null
     }
 }

@@ -4,7 +4,6 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
@@ -32,12 +31,10 @@ class MainActivity : ComponentActivity() {
 
 // Цветовая схема
 private val DarkBackground = Color(0xFF1C1C1E)
-private val DisplayBackground = Color(0xFF1C1C1E)
 private val NumberButton = Color(0xFF505050)
 private val OperatorButton = Color(0xFFFF9500)
 private val FunctionButton = Color(0xFFD4D4D2)
 private val TextWhite = Color.White
-private val TextBlack = Color.Black
 
 @Composable
 fun CalculatorApp() {
@@ -48,7 +45,7 @@ fun CalculatorApp() {
         modifier = Modifier
             .fillMaxSize()
             .background(DarkBackground)
-            .systemBarsPadding()
+            .windowInsetsPadding(androidx.compose.foundation.layout.WindowInsets.systemBars)
     ) {
         // Дисплей
         DisplayPanel(
@@ -165,7 +162,7 @@ fun ButtonsPanel(
                         Text(
                             text = label,
                             color = textColor,
-                            fontSize = if (isZero) 28.sp else 28.sp,
+                            fontSize = 28.sp,
                             fontWeight = FontWeight.Medium
                         )
                     }
