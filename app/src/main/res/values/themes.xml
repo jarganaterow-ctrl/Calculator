@@ -1,4 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.Calculator" parent="android:Theme.Material.Light.NoActionBar" />
+    <style name="Theme.NamazApp" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">#0F5132</item>
+        <item name="android:navigationBarColor">#0D1F17</item>
+    </style>
 </resources>

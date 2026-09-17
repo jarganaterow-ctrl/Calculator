@@ -14,5 +14,5 @@ dependencyResolution {
     }
 }
 
-rootProject.name = "Calculator"
+rootProject.name = "NamazApp"
 include(":app")
