@@ -5,6 +5,10 @@ rish/
 # Private device reports / local test output
 report-*
 animations.tsv
+game.tsv
+game-report-*
+frames-report-*
+monitor-*
 __pycache__/
 .pytest_cache/
 *.log

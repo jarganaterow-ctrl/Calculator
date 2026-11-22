@@ -23,16 +23,67 @@ elif name == 'stat':
     print(os.environ.get('MOCK_UID', '2000'))
 elif name == 'getprop':
     print('35' if args[0] == 'ro.build.version.sdk' else 'Mock Android')
+elif name == 'sleep':
+    pass
+elif name == 'am':
+    count_file = base / 'user-reads'
+    count = int(count_file.read_text()) + 1 if count_file.exists() else 1
+    count_file.write_text(str(count))
+    if os.environ.get('MOCK_SWITCH_USER_AT') and count >= int(os.environ['MOCK_SWITCH_USER_AT']):
+        print('10'); sys.exit(0)
+    switch = base / 'active-user'
+    print(switch.read_text() if switch.exists() else os.environ.get('MOCK_USER', '0'))
+elif name == 'cmd':
+    assert args[0] == 'game'
+    db = base / 'game.json'
+    mode = json.loads(db.read_text())['mode']
+    if os.environ.get('MOCK_NO_GAME_SERVICE'):
+        print('Unknown command: ' + args[1]); sys.exit(1)
+    if args[1] == 'list-modes':
+        if os.environ.get('MOCK_GAME_UNKNOWN_FORMAT'):
+            print('OEM game state unknown'); sys.exit(0)
+        available = os.environ.get('MOCK_GAME_MODES', 'standard,performance,battery,custom')
+        print(args[2] + ' current mode: ' + mode + ', available game modes: [' + available + ']')
+    elif args[1] == 'list-configs':
+        print(args[2] + ' interventions: none')
+    elif args[1] == 'mode':
+        assert args[2] == '--user'
+        target = args[4]
+        if target == 'performance' and os.environ.get('MOCK_GAME_FAIL'):
+            sys.exit(1)
+        if target == 'performance' and os.environ.get('MOCK_GAME_SILENT_FAIL'):
+            print('Error: permission denied'); sys.exit(0)
+        if target != 'performance' and os.environ.get('MOCK_GAME_RESTORE_FAIL'):
+            sys.exit(1)
+        db.write_text(json.dumps({'mode': target}))
+        if os.environ.get('MOCK_SWITCH_AFTER_WRITE'):
+            (base / 'active-user').write_text('10')
+        print('Set game mode to ' + target)
+    else: sys.exit(2)
 elif name == 'dumpsys':
     if args[0] == os.environ.get('MOCK_DUMP_FAIL'):
         print('Permission Denial'); sys.exit(1)
-    if args[0] == 'deviceidle':
+    if args[0] == 'thermalservice':
+        print('IsStatusOverride: ' + os.environ.get('MOCK_THERMAL_OVERRIDE', 'false'))
+        print('HAL Ready: ' + os.environ.get('MOCK_HAL_READY', 'true'))
+        print('Thermal Status: ' + os.environ.get('MOCK_THERMAL', '0'))
+    elif args[0] == 'gfxinfo':
+        frames = os.environ.get('MOCK_FRAMES', '100')
+        print('Applications Graphics Acceleration Info: private.process.name')
+        print('Stats since: 123456789ns')
+        print('Total frames rendered: ' + frames)
+        print('Janky frames: 4 (4.00%)')
+        print('50th percentile: 5ms\n90th percentile: 10ms\n95th percentile: 15ms\n99th percentile: 20ms')
+        print('50th gpu percentile: 4ms\n99th gpu percentile: 9ms')
+        print('Profile data in ms: private.activity.name')
+    elif args[0] == 'deviceidle':
         print('  mState=ACTIVE\n  Whitelist user apps: private.example.app')
     elif args[0] == 'display':
         print('  mSupportedModes=[{id=1, refreshRate=120.0}]\n  uniqueId=private-display-id')
     elif args[0] == 'diskstats':
         print('Data-Free: 1234K / 9999K total = 12% free\nPackage Names: [private.example.app]')
     else:
+        if os.environ.get('MOCK_BATTERY_SIMULATED'): print("(UPDATES STOPPED -- use 'reset' to restart)")
         print('level: 75\ntemperature: ' + os.environ.get('MOCK_TEMP', '320') + '\nstatus: mock')
 elif name == 'settings':
     db = base / 'settings.json'
@@ -73,13 +124,14 @@ class CareTests(unittest.TestCase):
         self.state = self.base / 'state'
         self.initial = dict(zip(KEYS, ['1.0', 'null', '1.25']))
         (self.base / 'settings.json').write_text(json.dumps(self.initial))
+        (self.base / 'game.json').write_text(json.dumps({'mode': 'standard'}))
         self.home = self.base / 'home'
         self.home.mkdir()
         self.env = dict(os.environ, MOCK_HOME=str(self.base), HOME=str(self.home))
         mock = self.bin / 'android-mock'
         mock.write_text(MOCK)
         mock.chmod(0o755)
-        for name in ['id', 'stat', 'getprop', 'dumpsys', 'settings', 'pm']:
+        for name in ['id', 'stat', 'getprop', 'dumpsys', 'settings', 'pm', 'am', 'cmd', 'sleep']:
             (self.bin / name).symlink_to(mock)
         # Only relocate the production constants in an isolated copy.
         # Production contains no environment-based privilege/test bypass.
@@ -268,6 +320,203 @@ class CareTests(unittest.TestCase):
         self.assertFalse((self.state / 'animations.tsv').exists())
         self.assertEqual(self.database(), {k: v for k, v in self.initial.items() if v != 'null'})
 
+    def game_writes(self):
+        return [c for c in self.calls() if c[:3] == ['cmd', 'game', 'mode']]
+
+    def test_disabled_and_faster_animations_are_never_slowed_down(self):
+        original = dict(zip(KEYS, ['0', '0.25', '1']))
+        (self.base / 'settings.json').write_text(json.dumps(original))
+        p = self.run_care('optimize', '--apply', stdin='ДА\n')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.database(), dict(zip(KEYS, ['0', '0.25', '0.5'])))
+        p = self.run_care('restore', '--apply', stdin='ДА\n')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.database(), original)
+
+    def test_game_report_and_frame_summary_are_read_only(self):
+        for action in ['game', 'frames']:
+            p = self.run_care(action, 'com.example.game')
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertTrue(list(self.state.glob(action + '-report-*')))
+        self.assertIn('99th percentile: 20ms', p.stdout)
+        self.assertIn('99th gpu percentile: 9ms', p.stdout)
+        self.assertNotIn('private.process.name', p.stdout)
+        self.assertNotIn('private.activity.name', p.stdout)
+        self.assertIn('НЕ замер FPS', p.stdout)
+        self.assertEqual(self.writes(), [])
+        self.assertEqual(self.game_writes(), [])
+
+    def test_empty_frames_and_permissions_do_not_claim_zero_fps(self):
+        p = self.run_care('frames', 'com.example.game', MOCK_FRAMES='0')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('Нет ненулевой HWUI-выборки', p.stdout)
+        p = self.run_care('frames', 'com.example.game', MOCK_DUMP_FAIL='gfxinfo')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('FPS и плавность не оценены', p.stdout)
+
+    def test_bad_packages_and_monitor_lengths_are_rejected_before_android_calls(self):
+        for package in ['--help', 'com.x;id', 'com.x$(id)', 'com.x/y', 'com..game', '.com.game', 'com.game.', '1com.game', 'com.1game', 'game', 'com.' + 'x' * 256]:
+            for action in ['game', 'frames', 'game-boost']:
+                p = self.run_care(action, package)
+                self.assertEqual(p.returncode, 2, (action, package, p.stderr))
+        for count in ['0', '13', '-1', '100000', '1;id', '--apply', '']:
+            p = self.run_care('monitor', count)
+            # An explicitly empty duration is invalid, not a default.
+            self.assertEqual(p.returncode, 2, (count, p.stderr))
+        self.assertEqual(self.calls(), [])
+
+    def test_monitor_csv_is_bounded_and_records_unknown_first_cpu_sample(self):
+        p = self.run_care('monitor', '3')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        report = next(self.state.glob('monitor-*'))
+        lines = report.read_text().splitlines()
+        self.assertEqual(len(lines), 4)
+        self.assertEqual(lines[1].split(',')[1], 'NA')
+        self.assertEqual(lines[1].split(',')[3:], ['32.0', '0'])
+        self.assertEqual(sum(c[0] == 'sleep' for c in self.calls()), 2)
+        self.assertEqual(report.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.writes(), [])
+        self.assertEqual(self.game_writes(), [])
+
+    def test_basic_monitor_never_calls_privileged_services(self):
+        p = self.run_care('monitor', '2', MOCK_UID='10234')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        report = next((self.home / '.android-care').glob('monitor-*'))
+        self.assertTrue(all(row.endswith(',NA,NA') for row in report.read_text().splitlines()[1:]))
+        self.assertFalse(any(c[0] in ['settings', 'dumpsys', 'pm', 'cmd', 'am'] for c in self.calls()))
+
+    def test_game_boost_plan_and_cancellation_do_not_write(self):
+        for args, stdin in [(('game-boost', 'com.example.game'), ''),
+                            (('game-boost', 'com.example.game', '--apply'), 'нет\n')]:
+            p = self.run_care(*args, stdin=stdin)
+            self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.game_writes(), [])
+        self.assertFalse((self.state / 'game.tsv').exists())
+
+    def test_game_mode_apply_verify_restore_and_preserve_snapshot(self):
+        p = self.run_care('game-boost', 'com.example.game', '--apply', stdin='ДА\n')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(json.loads((self.base / 'game.json').read_text())['mode'], 'performance')
+        snap = (self.state / 'game.tsv').read_text()
+        self.assertEqual(snap, '0\tcom.example.game\tstandard\n')
+        self.assertIn(['cmd', 'game', 'mode', '--user', '0', 'performance', 'com.example.game'], self.game_writes())
+        p = self.run_care('game-boost', 'com.other.game', '--apply', stdin='ДА\n')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual((self.state / 'game.tsv').read_text(), snap)
+        before = len(self.game_writes())
+        p = self.run_care('game-restore')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(len(self.game_writes()), before)
+        p = self.run_care('game-restore', '--apply', stdin='ДА\n')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(json.loads((self.base / 'game.json').read_text())['mode'], 'standard')
+        self.assertFalse((self.state / 'game.tsv').exists())
+
+    def test_game_mode_unsupported_or_unsafe_conditions_never_write(self):
+        variants = [dict(MOCK_NO_GAME_SERVICE='1'), dict(MOCK_GAME_MODES='standard,battery'),
+                    dict(MOCK_GAME_UNKNOWN_FORMAT='1'), dict(MOCK_THERMAL='2'),
+                    dict(MOCK_THERMAL_OVERRIDE='true'), dict(MOCK_HAL_READY='false'),
+                    dict(MOCK_THERMAL='6'), dict(MOCK_THERMAL='unknown'),
+                    dict(MOCK_DUMP_FAIL='thermalservice'), dict(MOCK_TEMP='400'),
+                    dict(MOCK_TEMP='430'), dict(MOCK_BATTERY_SIMULATED='1'), dict(MOCK_TEMP='unknown'), dict(MOCK_DUMP_FAIL='battery')]
+        for env in variants:
+            p = self.run_care('game-boost', 'com.example.game', '--apply', stdin='ДА\n', **env)
+            self.assertNotEqual(p.returncode, 0, (env, p.stdout, p.stderr))
+            self.assertFalse((self.state / 'game.tsv').exists())
+        self.assertEqual(self.game_writes(), [])
+
+    def test_game_mode_failed_and_silent_writes_attempt_rollback(self):
+        for variable in ['MOCK_GAME_FAIL', 'MOCK_GAME_SILENT_FAIL']:
+            p = self.run_care('game-boost', 'com.example.game', '--apply', stdin='ДА\n', **{variable: '1'})
+            self.assertNotEqual(p.returncode, 0)
+            self.assertFalse((self.state / 'game.tsv').exists())
+            self.assertEqual(json.loads((self.base / 'game.json').read_text())['mode'], 'standard')
+
+    def test_game_restore_for_different_user_refuses_then_can_retry(self):
+        p = self.run_care('game-boost', 'com.example.game', '--apply', stdin='ДА\n')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        n = len(self.game_writes())
+        p = self.run_care('game-restore', '--apply', stdin='ДА\n', MOCK_USER='10')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(len(self.game_writes()), n)
+        self.assertTrue((self.state / 'game.tsv').exists())
+        p = self.run_care('game-restore', '--apply', stdin='ДА\n')
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_game_user_switch_after_confirmation_never_writes(self):
+        p = self.run_care('game-boost', 'com.example.game', '--apply', stdin='ДА\n', MOCK_SWITCH_USER_AT='3')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('Пользователь изменился', p.stderr)
+        self.assertFalse((self.state / 'game.tsv').exists())
+        self.assertEqual(self.game_writes(), [])
+
+    def test_audit_does_not_trust_simulated_battery_temperature(self):
+        p = self.run_care('audit', MOCK_BATTERY_SIMULATED='1')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('Батарея: оценка температуры недоступна.', p.stdout)
+        self.assertNotIn('Температура батареи: 32.0', p.stdout)
+
+    def test_game_user_switch_during_write_keeps_recovery_snapshot(self):
+        p = self.run_care('game-boost', 'com.example.game', '--apply', stdin='ДА\n', MOCK_SWITCH_AFTER_WRITE='1')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertTrue((self.state / 'game.tsv').exists())
+        self.assertIn('game-restore --apply', p.stderr)
+        (self.base / 'active-user').unlink()
+        p = self.run_care('game-restore', '--apply', stdin='ДА\n')
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_game_restore_error_keeps_snapshot_until_success(self):
+        p = self.run_care('game-boost', 'com.example.game', '--apply', stdin='ДА\n')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        p = self.run_care('game-restore', '--apply', stdin='ДА\n', MOCK_GAME_RESTORE_FAIL='1')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertTrue((self.state / 'game.tsv').exists())
+        self.assertFalse((self.state / 'lock').exists())
+        p = self.run_care('game-restore', '--apply', stdin='ДА\n')
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_game_battery_and_custom_modes_are_restored_exactly(self):
+        for mode in ['battery', 'custom']:
+            (self.base / 'game.json').write_text(json.dumps({'mode': mode}))
+            p = self.run_care('game-boost', 'com.example.game', '--apply', stdin='ДА\n')
+            self.assertEqual(p.returncode, 0, p.stderr)
+            p = self.run_care('game-restore', '--apply', stdin='ДА\n')
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertEqual(json.loads((self.base / 'game.json').read_text())['mode'], mode)
+
+    def test_already_performance_does_not_create_snapshot(self):
+        (self.base / 'game.json').write_text(json.dumps({'mode': 'performance'}))
+        p = self.run_care('game-boost', 'com.example.game', '--apply', stdin='ДА\n')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertFalse((self.state / 'game.tsv').exists())
+        self.assertEqual(self.game_writes(), [])
+
+    def test_new_menu_actions_work_without_hidden_writes(self):
+        p = self.run_care('menu', stdin='5\ncom.example.game\n6\ncom.example.game\n8\ncom.example.game\nДА\n9\nДА\n7\n0\n')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertTrue(list(self.state.glob('game-report-*')))
+        self.assertTrue(list(self.state.glob('frames-report-*')))
+        self.assertTrue(list(self.state.glob('monitor-*')))
+        self.assertFalse((self.state / 'game.tsv').exists())
+        self.assertEqual(self.writes(), [])
+        self.assertEqual(len(self.game_writes()), 2)
+
+    def test_corrupt_game_snapshot_is_data_not_code(self):
+        self.state.mkdir()
+        for text in ['0\tcom.example.game\t$(id)\n', '0\tcom.example.game\tstandard\n' * 2,
+                     '0\tcom.example.game;id\tstandard\n', 'bad\tcom.example.game\tstandard\n']:
+            (self.state / 'game.tsv').write_text(text)
+            p = self.run_care('game-restore', '--apply', stdin='ДА\n')
+            self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(self.game_writes(), [])
+
+    def test_basic_game_actions_never_escalate(self):
+        for args in [('game', 'com.example.game'), ('frames', 'com.example.game'),
+                     ('game-boost', 'com.example.game', '--apply'), ('game-restore', '--apply')]:
+            p = self.run_care(*args, stdin='ДА\n', MOCK_UID='10234')
+            self.assertNotEqual(p.returncode, 0)
+        self.assertFalse(any(c[0] in ['settings', 'dumpsys', 'pm', 'cmd', 'am'] for c in self.calls()))
+
     def launcher(self, uid='10234', rish=None):
         shutil.copy(ROOT / 'run.sh', self.base / 'run.sh')
         local_bin = self.base / 'local-bin'
@@ -295,20 +544,20 @@ class CareTests(unittest.TestCase):
         reports = list((self.home / '.android-care').glob('report-*'))
         self.assertEqual(len(reports), 1)
         self.assertEqual(reports[0].stat().st_mode & 0o777, 0o600)
-        self.assertFalse(any(c[0] in ['settings', 'dumpsys', 'pm'] for c in self.calls()))
+        self.assertFalse(any(c[0] in ['settings', 'dumpsys', 'pm', 'am', 'cmd'] for c in self.calls()))
         self.assertFalse(self.state.exists())
 
     def test_basic_apply_is_blocked_for_all_actions(self):
         for action in ['optimize', 'restore', 'trim']:
             p = self.run_care(action, '--apply', stdin='ДА\n', MOCK_UID='10234')
             self.assertNotEqual(p.returncode, 0)
-        self.assertFalse(any(c[0] in ['settings', 'dumpsys', 'pm'] for c in self.calls()))
+        self.assertFalse(any(c[0] in ['settings', 'dumpsys', 'pm', 'am', 'cmd'] for c in self.calls()))
 
     def test_basic_menu_cannot_escalate(self):
         p = self.run_care('menu', stdin='2\n3\n4\n1\n0\n', MOCK_UID='10234')
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(p.stdout.count('Недоступно без Shizuku/rish'), 3)
-        self.assertFalse(any(c[0] in ['settings', 'dumpsys', 'pm'] for c in self.calls()))
+        self.assertFalse(any(c[0] in ['settings', 'dumpsys', 'pm', 'am', 'cmd'] for c in self.calls()))
 
     def test_launcher_without_rish_runs_basic_audit(self):
         env = dict(self.launcher(), MOCK_UID='10234')
@@ -323,7 +572,9 @@ class CareTests(unittest.TestCase):
                            capture_output=True, env=env, timeout=30)
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn('БАЗОВЫЙ', p.stdout)
-        for args in [('menu',), ('optimize', '--apply'), ('trim', '--apply'), ('restore', '--apply')]:
+        for args in [('menu',), ('optimize', '--apply'), ('trim', '--apply'), ('restore', '--apply'),
+                     ('game-boost', 'com.example.game', '--apply'), ('game-restore', '--apply'),
+                     ('game', 'com.example.game'), ('frames', 'com.example.game'), ('monitor', '2')]:
             p = subprocess.run(['sh', str(self.base / 'run.sh'), *args], input='ДА\n',
                                text=True, capture_output=True, env=env, timeout=30)
             self.assertEqual(p.returncode, 42, p.stderr)

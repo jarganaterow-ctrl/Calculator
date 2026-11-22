@@ -3,13 +3,15 @@
 # No root, downloads, telemetry, eval, package removal or background services.
 set -u
 PATH=/system/bin:/system/xbin:/vendor/bin
-export PATH
+LC_ALL=C
+export PATH LC_ALL
 umask 077
 STATE=/data/local/tmp/android-care
 KEYS='window_animation_scale transition_animation_scale animator_duration_scale'
 LOCKED=0
 CHANGING=0
 BASIC=0
+GAMING=0
 REPORT=
 
 say() { printf '%s\n' "$*"; }
@@ -19,8 +21,14 @@ usage() {
 Android Care
   audit                 Диагностика (по умолчанию); настройки не меняются
   menu                  Интерактивное меню
+  game PACKAGE          Game Manager: режимы и существующие конфигурации
+  frames PACKAGE        Накопленная HWUI-статистика (не игровой FPS)
+  monitor [1..12]       CSV наблюдения: CPU, память, батарея, thermal; по умолчанию 6 отсчётов
+  game-boost PACKAGE    План штатного performance-режима
+  game-boost PACKAGE --apply  Применить после проверки поддержки, температуры и подтверждения
+  game-restore [--apply] Вернуть сохранённый Game Mode
   optimize              План ускорения анимаций, без изменений
-  optimize --apply      Сохранить исходные значения и поставить анимации 0.5x
+  optimize --apply      Ограничить анимации 0.5x, сохранив уже более быстрые значения
   restore               План отката
   restore --apply       Восстановить исходные анимации
   trim                  План очистки восстанавливаемого кэша
@@ -30,12 +38,15 @@ Android Care
 HELP
 }
 cleanup() {
+    if [ "$GAMING" = 1 ]; then
+        say "Изменение Game Mode не завершено. Снимок: $STATE/game.tsv; выполните game-restore --apply." >&2
+    fi
     if [ "$CHANGING" = 1 ]; then
         say "Изменение прервано. Снимок сохранён: $STATE/animations.tsv" >&2
         say 'Выполните restore --apply для восстановления.' >&2
     fi
     if [ "$LOCKED" = 1 ]; then
-        rm -f "$STATE/command.tmp" "$STATE/command.tmp.packages" "$STATE/animations.tmp"
+        rm -f "$STATE/command.tmp" "$STATE/command.tmp.packages" "$STATE/animations.tmp" "$STATE/game.tmp"
         rmdir "$STATE/lock" 2>/dev/null || :
     fi
 }
@@ -67,7 +78,7 @@ init() {
     trap 'exit 143' TERM HUP
     cd / || fail 'Не удалось сменить каталог.'
     command -v timeout >/dev/null 2>&1 || fail 'Нет системной команды timeout; небезопасно запускать диагностику без лимитов.'
-    for file in animations.tsv animations.tmp command.tmp command.tmp.packages; do
+    for file in animations.tsv animations.tmp game.tsv game.tmp command.tmp command.tmp.packages; do
         [ ! -L "$STATE/$file" ] || fail "Недопустимая ссылка: $file"
     done
 }
@@ -136,16 +147,16 @@ findings() {
     else say 'Хранилище: свободное место не удалось прочитать.'; fi
     if [ "$BASIC" = 1 ]; then
         say 'Батарея: температура недоступна без shell-доступа; не оценивается.'
-    elif bounded 10 dumpsys battery > "$STATE/command.tmp" 2>/dev/null; then
-        awk '
-            /^[[:space:]]*temperature:/ && $2 ~ /^-?[0-9]+$/ {
-                found=1; t=$2/10
-                printf "Температура батареи: %.1f °C.\n", t
-                if (t >= 40) print "Батарея тёплая/горячая: снизьте нагрузку, особенно при зарядке. 40 °C — ориентир, не диагноз."
-            }
-            END { if (!found) print "Температура батареи: нет достоверного показания." }
-        ' "$STATE/command.tmp"
+    elif measured=$(battery_temperature); then
+        printf 'Температура батареи: %s °C.\n' "$measured"
+        awk -v t="$measured" 'BEGIN { if(t>=40) print "Батарея тёплая/горячая: снизьте нагрузку, особенно при зарядке. 40 °C — ориентир, не диагноз." }'
     else say 'Батарея: оценка температуры недоступна.'; fi
+    if [ "$BASIC" = 0 ]; then
+        if status=$(thermal_status); then
+            say "Thermal Status Android: $status (0 — нет ограничения, 1 — лёгкое, 2–6 — усиливающиеся ограничения)."
+            case "$status" in 0|1) ;; *) say 'Есть тепловое ограничение. Не усиливайте нагрузку, дайте устройству остыть.' ;; esac
+        else say 'Thermal Status: нет достоверного ответа без override и с готовым HAL.'; fi
+    fi
     say 'Это разовый снимок. Отсутствие предупреждений не гарантирует исправность устройства.'
 }
 audit() {
@@ -272,7 +283,7 @@ restore_values() {
     CHANGING=0
 }
 optimize() {
-    say 'План: window_animation_scale, transition_animation_scale, animator_duration_scale → 0.5x.'
+    say 'План: анимации не выше 0.5x. Уже выключенные или более быстрые анимации сохраняются.'
     say 'Это сокращает ожидание анимаций, но не повышает вычислительную мощность. Есть откат.'
     [ "$APPLY" = 1 ] || { say 'Сейчас ничего не изменено. Для применения: optimize --apply.'; return 0; }
     [ ! -e "$STATE/animations.tsv" ] || fail 'Снимок уже есть. Сначала выполните restore --apply; исходные значения не перезаписываются.'
@@ -280,14 +291,15 @@ optimize() {
     snapshot || fail 'Не удалось сохранить корректные исходные значения. Настройки не менялись.'
     CHANGING=1
     for key in $KEYS; do
-        if ! write_value "$key" 0.5; then
+        target=$(awk -F '\t' -v k="$key" '$1==k { if ($2!="null" && $2+0 <= 0.5) print $2; else print "0.5" }' "$STATE/animations.tsv")
+        if ! write_value "$key" "$target"; then
             say "Ошибка записи/проверки $key. Пробую откат…" >&2
             restore_values || say 'Откат неполный. Снимок сохранён, повторите restore --apply.' >&2
             return 1
         fi
     done
     CHANGING=0
-    say "Готово: анимации 0.5x. Исходные значения: $STATE/animations.tsv"
+    say "Готово: анимации не выше 0.5x. Исходные значения: $STATE/animations.tsv"
     say 'Отмена изменений: restore --apply. Очистка кэша НЕ запускалась.'
 }
 restore() {
@@ -320,38 +332,258 @@ trim_cache() {
         return 1
     fi
 }
+# Strictly accept Java-style package names; never interpolate them into shell code.
+valid_package() {
+    pname=$1
+    [ "${#pname}" -le 255 ] || return 1
+    case "$pname" in *.*) ;; *) return 1 ;; esac
+    while :; do
+        case "$pname" in *.*) part=${pname%%.*}; pname=${pname#*.} ;; *) part=$pname; pname= ;; esac
+        case "$part" in ''|[!a-zA-Z]*|*[!a-zA-Z0-9_]*) return 1 ;; esac
+        [ -n "$pname" ] || break
+    done
+    case "$1" in *.) return 1 ;; esac
+}
+require_shell() {
+    [ "$BASIC" = 0 ] || { say 'Недоступно без Shizuku/rish или ADB. Настройки не менялись.' >&2; return 1; }
+}
+current_user() {
+    cu=$(bounded 5 am get-current-user) || return 1
+    case "$cu" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s\n' "$cu"
+}
+thermal_status() {
+    bounded 3 dumpsys thermalservice > "$STATE/command.tmp" 2>/dev/null || return 1
+    awk '/^[[:space:]]*IsStatusOverride: false[[:space:]]*$/ { real=1 }
+        /^[[:space:]]*HAL Ready: true[[:space:]]*$/ { ready=1 }
+        /^[[:space:]]*Thermal Status: [0-6][[:space:]]*$/ { n++; v=$3 }
+        END { if (n == 1 && real && ready) print v; else exit 1 }' "$STATE/command.tmp"
+}
+battery_temperature() {
+    bounded 3 dumpsys battery > "$STATE/command.tmp" 2>/dev/null || return 1
+    awk '/UPDATES STOPPED/ { fake=1 }
+        /^[[:space:]]*temperature:/ && $2 ~ /^-?[0-9]+$/ { n++; v=$2 }
+        END { if (n == 1 && !fake && v >= -500 && v <= 1000) printf "%.1f\n", v/10; else exit 1 }' "$STATE/command.tmp"
+}
+game_report() {
+    require_shell || return 1
+    REPORT=$(mktemp "$STATE/game-report-XXXXXX") || return 1
+    {
+        say "ANDROID CARE · игра: $PACKAGE"; date
+        say 'Только чтение. Доступность Game Manager зависит от Android, прошивки и категории приложения.'
+    } > "$REPORT"
+    section 'Поддерживаемые режимы и текущий выбор' cmd game list-modes "$PACKAGE"
+    section 'Существующие вмешательства Android (НЕ создаются скриптом)' cmd game list-configs "$PACKAGE"
+    section 'Бюджет кадров: справка' sh -c 'printf "60 Гц: 16.67 мс; 90 Гц: 11.11 мс; 120 Гц: 8.33 мс; 144 Гц: 6.94 мс.\nГц не равны фактическому FPS. Производительность надо измерять в самой игре.\n"'
+    say 'Performance может увеличить расход и нагрев; эффект определяется игрой и системой.' >> "$REPORT"
+    cat "$REPORT"; say "Отчёт сохранён: $REPORT"
+}
+frames_report() {
+    require_shell || return 1
+    REPORT=$(mktemp "$STATE/frames-report-XXXXXX") || return 1
+    {
+        say "ANDROID CARE · HWUI-статистика: $PACKAGE"; date
+        say 'Это накопленные данные Android HWUI, НЕ замер FPS игры. Счётчики не сбрасываются.'
+        say 'OpenGL/Vulkan/SurfaceView могут не отражаться; меню игры не представляет её игровой рендер.'
+    } > "$REPORT"
+    if bounded 15 dumpsys gfxinfo "$PACKAGE" > "$STATE/command.tmp" 2>&1; then
+        if grep -Eiq 'error|exception|denied|not found|no process' "$STATE/command.tmp"; then
+            say 'Статистика недоступна. Приложение может быть не запущено или доступ запрещён.' >> "$REPORT"
+        elif grep -Eq '^[[:space:]]*Total frames rendered: [1-9][0-9]*' "$STATE/command.tmp"; then
+            grep -E '^[[:space:]]*(Stats since:|Total frames rendered:|Janky frames|50th percentile:|90th percentile:|95th percentile:|99th percentile:|50th gpu percentile:|90th gpu percentile:|95th gpu percentile:|99th gpu percentile:|Number (Missed Vsync|High input latency|Slow UI thread|Slow bitmap uploads|Slow issue draw commands|Frame deadline missed))' "$STATE/command.tmp" >> "$REPORT"
+        else
+            say 'Нет ненулевой HWUI-выборки. Это НЕ 0 FPS и не доказательство отсутствия лагов.' >> "$REPORT"
+        fi
+    else say 'gfxinfo недоступен / таймаут. FPS и плавность не оценены.' >> "$REPORT"; fi
+    say 'Для сравнения: одинаковый сценарий и настройки; несколько прогонов после прогрева. Для глубокой причины — Perfetto.' >> "$REPORT"
+    cat "$REPORT"; say "Отчёт сохранён: $REPORT"
+}
+# Read the current user's AOSP text format. Unknown/OEM formats fail closed for writes.
+read_game() {
+    GAME_USER=$(current_user) || return 1
+    bounded 10 cmd game list-modes "$1" > "$STATE/command.tmp" 2>&1 || return 1
+    parsed=$(awk -v pkg="$1" '
+        { prefix=pkg " current mode: "
+          if (index($0,prefix) != 1) { bad=1; next }
+          rest=substr($0,length(prefix)+1)
+          if (split(rest,a,", available game modes: ") != 2) { bad=1; next }
+          if (a[1] !~ /^(standard|performance|battery|custom)$/) { bad=1; next }
+          if (a[2] !~ /^\[.*\]$/) { bad=1; next }
+          modes=substr(a[2],2,length(a[2])-2); gsub(/ /,"",modes)
+          if (modes !~ /^(standard|performance|battery|custom|unsupported)(,(standard|performance|battery|custom|unsupported))*$/) { bad=1; next }
+          result=a[1] "|" modes
+        }
+        END { if (bad || NR != 1) exit 1; print result }
+    ' "$STATE/command.tmp") || return 1
+    [ "$(current_user)" = "$GAME_USER" ] || return 1
+    GAME_CURRENT=${parsed%%|*}
+    GAME_AVAILABLE=${parsed#*|}
+}
+valid_game_snapshot() {
+    [ -f "$STATE/game.tsv" ] || return 1
+    awk -F '\t' 'NF != 3 || $1 !~ /^[0-9]+$/ || $2 !~ /^[a-zA-Z][a-zA-Z0-9_]*([.][a-zA-Z][a-zA-Z0-9_]*)+$/ || length($2)>255 || $3 !~ /^(standard|performance|battery|custom)$/ { bad=1 }
+        END { exit (bad || NR != 1) }' "$STATE/game.tsv"
+}
+write_game_mode() {
+    require_shell || return 1
+    [ "$(current_user)" = "$3" ] || return 1
+    bounded 10 cmd game mode --user "$3" "$1" "$2" > "$STATE/command.tmp" 2>&1 || return 1
+    read_game "$2" || return 1
+    [ "$GAME_CURRENT" = "$1" ] && [ "$GAME_USER" = "$3" ]
+}
+restore_game_values() {
+    valid_game_snapshot || { say 'Снимок Game Mode отсутствует или повреждён.' >&2; return 1; }
+    IFS="$(printf '\t')" read -r saved_user saved_package saved_mode < "$STATE/game.tsv" || return 1
+    if ! write_game_mode "$saved_mode" "$saved_package" "$saved_user"; then
+        say 'Откат Game Mode не подтверждён. Переключитесь на исходного пользователя, проверьте доступ и повторите.' >&2
+        return 1
+    fi
+    rm -f "$STATE/game.tsv" || return 1
+    GAMING=0
+    say "Восстановлено: $saved_package, пользователь $saved_user, режим $saved_mode."
+}
+game_boost() {
+    say "План: выбрать штатный Game Mode performance для $PACKAGE, только если он поддерживается."
+    say 'Не создаёт device_config overrides и не меняет термозащиту. Возможен рост расхода и нагрева.'
+    say 'Выбранный режим может задействовать существующие настройки FPS/масштабирования Android или игры.'
+    [ "$APPLY" = 1 ] || { say 'Ничего не изменено. Для применения: game-boost PACKAGE --apply.'; return 0; }
+    require_shell || return 1
+    [ ! -e "$STATE/game.tsv" ] || { say 'Есть снимок Game Mode: сначала game-restore --apply.' >&2; return 1; }
+    read_game "$PACKAGE" || { say 'Нет совместимого Game Manager / игра не поддерживается / неизвестный формат ответа.' >&2; return 1; }
+    case ",$GAME_AVAILABLE," in *,performance,*) ;; *) say 'Performance не поддерживается. Принудительные overrides не создаются.' >&2; return 1 ;; esac
+    say "Пользователь $GAME_USER, текущий режим: $GAME_CURRENT; доступно: $GAME_AVAILABLE."
+    [ "$GAME_CURRENT" != performance ] || { say 'Уже performance. Ничего не изменено.'; return 0; }
+    plan_user=$GAME_USER
+    confirm || { say 'Отменено.'; return 0; }
+    # Re-read after user interaction, then journal before the first write.
+    read_game "$PACKAGE" || return 1
+    [ "$GAME_USER" = "$plan_user" ] || { say 'Пользователь изменился после подтверждения. Запустите действие заново.' >&2; return 1; }
+    case ",$GAME_AVAILABLE," in *,performance,*) ;; *) return 1 ;; esac
+    heat=$(thermal_status) || { say 'Нет надёжного Thermal Status. Усиление нагрузки не применяется.' >&2; return 1; }
+    case "$heat" in 0|1) ;; *) say 'Есть умеренное или более сильное тепловое ограничение. Дайте устройству остыть.' >&2; return 1 ;; esac
+    temp=$(battery_temperature) || { say 'Температура батареи недоступна. Performance не применяется.' >&2; return 1; }
+    awk -v t="$temp" 'BEGIN { exit (t >= 40) }' || { say 'Батарея 40 °C или выше: performance не применяется.' >&2; return 1; }
+    printf '%s\t%s\t%s\n' "$GAME_USER" "$PACKAGE" "$GAME_CURRENT" > "$STATE/game.tmp" || return 1
+    mv "$STATE/game.tmp" "$STATE/game.tsv" || return 1
+    valid_game_snapshot || return 1
+    boost_user=$GAME_USER
+    GAMING=1
+    if ! write_game_mode performance "$PACKAGE" "$boost_user"; then
+        say 'Применение Game Mode не подтверждено. Пробую восстановить исходный режим…' >&2
+        restore_game_values || :
+        return 1
+    fi
+    GAMING=0
+    say 'Выбран штатный performance. Это не гарантия прироста: сравните одинаковые игровые сценарии.'
+    say 'Для отката: game-restore --apply. Скрипт не остаётся работать в фоне.'
+}
+game_restore() {
+    valid_game_snapshot || { say 'Нет корректного снимка Game Mode.' >&2; return 1; }
+    say 'Будет восстановлен режим из снимка (пользователь / пакет / режим):'; cat "$STATE/game.tsv"
+    [ "$APPLY" = 1 ] || { say 'Ничего не изменено. Для отката: game-restore --apply.'; return 0; }
+    require_shell || return 1
+    confirm || { say 'Отменено.'; return 0; }
+    GAMING=1
+    restore_game_values
+}
+cpu_counters() {
+    # guest time is already part of user/nice: sum only the first eight counters.
+    awk '$1=="cpu" { for(i=2;i<=9;i++) total+=$i; printf "%.0f %.0f\n",total,$5+$6; found=1; exit }
+        END { if(!found) exit 1 }' /proc/stat 2>/dev/null
+}
+monitor_line() { say "$1"; say "$1" >> "$REPORT"; }
+monitor() {
+    REPORT=$(mktemp "$STATE/monitor-XXXXXX") || return 1
+    say "Наблюдение: $SAMPLES отсчётов, пауза 5 с между ними плюс время чтения датчиков. Не стресс-тест."
+    say "CSV: $REPORT; NA = недоступно. Датчики не отключаются; нагрузка самих измерений ненулевая."
+    monitor_line 'epoch_s,cpu_busy_pct,mem_available_kib,battery_c,thermal_status'
+    i=1; previous_total=; previous_idle=
+    while [ "$i" -le "$SAMPLES" ]; do
+        busy=NA
+        counters=$(cpu_counters) || counters=
+        if [ -n "$counters" ]; then
+            total=${counters% *}; idle=${counters#* }
+            if [ -n "$previous_total" ]; then
+                busy=$(awk -v t="$total" -v p="$previous_total" -v d="$idle" -v q="$previous_idle" 'BEGIN { dt=t-p; di=d-q; if(dt>0 && di>=0 && di<=dt) printf "%.1f",100*(dt-di)/dt; else printf "NA" }')
+            fi
+            previous_total=$total; previous_idle=$idle
+        else previous_total=; previous_idle=; fi
+        memory=$(awk '/^MemAvailable:/ && $2 ~ /^[0-9]+$/ { print $2; f=1; exit } END { if(!f) print "NA" }' /proc/meminfo 2>/dev/null) || memory=NA
+        bt=NA; ts=NA
+        if [ "$BASIC" = 0 ]; then
+            bt=$(battery_temperature) || bt=NA
+            ts=$(thermal_status) || ts=NA
+        fi
+        monitor_line "$(date +%s),$busy,$memory,$bt,$ts"
+        i=$((i + 1))
+        if [ "$i" -le "$SAMPLES" ]; then sleep 5; fi
+    done
+    say 'Нагрузка CPU — агрегат по всем ядрам между отсчётами, не CPU игры и не FPS.'
+    say 'Thermal Status 0–6 — шкала Android, не температура. Для сравнения нужны одинаковые условия.'
+    say "Мониторинг сохранён: $REPORT"
+}
+
 menu() {
     while :; do
         say ''; say 'ANDROID CARE'
         if [ "$BASIC" = 1 ]; then say 'Базовый режим: только диагностика; изменения требуют shell-доступа.'; fi
         say '1 — Проверить устройство'; say '2 — Анимации 0.5x (с подтверждением)'
-        say '3 — Восстановить анимации (с подтверждением)'; say '4 — Очистить кэш (с подтверждением)'; say '0 — Выход'
+        say '3 — Восстановить анимации (с подтверждением)'; say '4 — Очистить кэш (с подтверждением)'
+        say '5 — Проверить игру'; say '6 — HWUI-кадры приложения'; say '7 — Мониторинг (6 отсчётов)'
+        say '8 — Штатный игровой performance (с подтверждением)'; say '9 — Откат Game Mode (с подтверждением)'; say '0 — Выход'
         IFS= read -r choice || return 0
         if [ "$BASIC" = 1 ]; then
-            case "$choice" in 2|3|4) say 'Недоступно без Shizuku/rish или ADB. Настройки не менялись.'; continue ;; esac
+            case "$choice" in 2|3|4|5|6|8|9) say 'Недоступно без Shizuku/rish или ADB. Настройки не менялись.'; continue ;; esac
         fi
+        case "$choice" in
+            5|6|8)
+                say 'Введите имя пакета, например com.example.game:'
+                IFS= read -r PACKAGE || return 0
+                valid_package "$PACKAGE" || { say 'Некорректное имя пакета.'; continue; } ;;
+        esac
         APPLY=1
         case "$choice" in
             1) audit ;; 2) optimize ;; 3) if valid_snapshot; then restore; else say 'Нет корректного снимка.'; fi ;;
-            4) trim_cache ;; 0) return 0 ;; *) say 'Выберите 0–4.' ;;
+            4) trim_cache ;; 5) game_report ;; 6) frames_report ;; 7) SAMPLES=6; monitor ;;
+            8) game_boost ;; 9) game_restore ;; 0) return 0 ;; *) say 'Выберите 0–9.' ;;
         esac
         # Stop on incomplete transactions; never allow a new snapshot over one.
-        [ "$CHANGING" = 0 ] || return 1
+        [ "$CHANGING" = 0 ] && [ "$GAMING" = 0 ] || return 1
     done
 }
 main() {
     ACTION=${1:-audit}
     APPLY=0
-    [ "$#" -le 2 ] || { usage; exit 2; }
-    if [ "$#" -eq 2 ]; then
-        [ "$2" = --apply ] || { usage; exit 2; }
-        case "$ACTION" in optimize|restore|trim) APPLY=1 ;; *) usage; exit 2 ;; esac
-    fi
+    PACKAGE=
+    SAMPLES=6
     case "$ACTION" in
-        help|--help|-h) usage; return 0 ;;
-        audit|menu|optimize|restore|trim) ;; *) usage; exit 2 ;;
+        help|--help|-h) [ "$#" -le 1 ] || { usage; exit 2; }; usage; return 0 ;;
+        audit|menu) [ "$#" -le 1 ] || { usage; exit 2; } ;;
+        monitor)
+            [ "$#" -le 2 ] || { usage; exit 2; }
+            SAMPLES=${2-6}
+            case "$SAMPLES" in 1|2|3|4|5|6|7|8|9|10|11|12) ;; *) usage; exit 2 ;; esac ;;
+        game|frames|game-boost)
+            [ "$#" -ge 2 ] && [ "$#" -le 3 ] || { usage; exit 2; }
+            PACKAGE=$2
+            valid_package "$PACKAGE" || { say 'Некорректное имя пакета.' >&2; exit 2; }
+            if [ "$#" -eq 3 ]; then
+                [ "$ACTION" = game-boost ] && [ "$3" = --apply ] || { usage; exit 2; }
+                APPLY=1
+            fi ;;
+        optimize|restore|trim|game-restore)
+            [ "$#" -le 2 ] || { usage; exit 2; }
+            if [ "$#" -eq 2 ]; then
+                [ "$2" = --apply ] || { usage; exit 2; }
+                APPLY=1
+            fi ;;
+        *) usage; exit 2 ;;
     esac
     init
-    case "$ACTION" in audit) audit ;; menu) menu ;; optimize) optimize ;; restore) restore ;; trim) trim_cache ;; esac
+    case "$ACTION" in
+        audit) audit ;; menu) menu ;; optimize) optimize ;; restore) restore ;; trim) trim_cache ;;
+        game) game_report ;; frames) frames_report ;; monitor) monitor ;;
+        game-boost) game_boost ;; game-restore) game_restore ;;
+    esac
 }
 main "$@"
