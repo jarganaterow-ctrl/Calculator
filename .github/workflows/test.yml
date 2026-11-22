@@ -1,0 +1,17 @@
+name: Shell checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax
+        run: |
+          sh -n run.sh
+          sh -n scripts/android-care.sh
+      - name: ShellCheck
+        run: shellcheck -s sh run.sh scripts/android-care.sh
+      - name: Mock Android regression tests
+        run: python3 -m unittest discover -s tests -v
